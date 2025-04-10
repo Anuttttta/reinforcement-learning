@@ -1,0 +1,277 @@
+!pip install gymnasium gymnasium-retro ale-py torch matplotlib moviepy
+!pip install ale-py
+!pip install gymnasium-retro
+from ale_py import ALEInterface
+ALEInterface()
+
+
+!pip install shimmy[atari]
+import gymnasium as gym
+
+# Создаем окружение через shimmy
+env = gym.make('ALE/Alien-v5', render_mode='rgb_array')
+
+# Выводим параметры среды
+print("Observation space:", env.observation_space)
+print("Action space:", env.action_space)
+
+import gymnasium as gym
+
+# Инициализация окружения
+env = gym.make('ALE/Alien-v5', render_mode='rgb_array')
+
+# Параметры среды
+state_shape = env.observation_space.shape  # Размер входного изображения
+action_space = env.action_space.n         # Число возможных действий
+
+print(f"State shape: {state_shape}")  # Например, (210, 160, 3)
+print(f"Action space: {action_space}")  # Например, 18
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+class DQNNetwork(nn.Module):
+    def __init__(self, input_shape, num_actions):
+        super(DQNNetwork, self).__init__()
+        
+        # Сверточные слои
+        self.conv = nn.Sequential(
+            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU()
+        )
+        
+        # Вычисляем выходной размер после сверток
+        conv_out_size = self._get_conv_out(input_shape)
+        
+        # Полносвязные слои
+        self.fc = nn.Sequential(
+            nn.Linear(conv_out_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, num_actions)
+        )
+    
+    def _get_conv_out(self, shape):
+        o = self.conv(torch.zeros(1, *shape))
+        return int(np.prod(o.size()))
+    
+    def forward(self, x):
+        conv_out = self.conv(x.float() / 255.0).view(x.size()[0], -1)
+        return self.fc(conv_out)
+
+# Создаем две сети: основную и целевую
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+input_shape = (4, 84, 84)  # 4 кадра, преобразованные в черно-белые и уменьшенные до 84x84
+num_actions = action_space
+
+policy_net = DQNNetwork(input_shape, num_actions).to(device)
+target_net = DQNNetwork(input_shape, num_actions).to(device)
+target_net.load_state_dict(policy_net.state_dict())
+target_net.eval()
+
+optimizer = optim.Adam(policy_net.parameters(), lr=0.0001)
+
+import cv2
+from collections import deque
+
+def preprocess_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
+    return resized
+
+def stack_frames(frames, new_frame):
+    frames.append(new_frame)
+    while len(frames) > 4:
+        frames.pop(0)
+    return np.stack(frames, axis=0)
+
+import random
+from collections import deque
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+    
+    def sample(self, batch_size):
+        states, actions, rewards, next_states, dones = zip(*random.sample(self.buffer, batch_size))
+        return (
+            torch.tensor(np.array(states), dtype=torch.float32).to(device),
+            torch.tensor(actions, dtype=torch.int64).unsqueeze(1).to(device),
+            torch.tensor(rewards, dtype=torch.float32).unsqueeze(1).to(device),
+            torch.tensor(np.array(next_states), dtype=torch.float32).to(device),
+            torch.tensor(dones, dtype=torch.bool).unsqueeze(1).to(device)
+        )
+    
+    def __len__(self):
+        return len(self.buffer)
+import torch.nn.functional as F
+
+def train_dqn(policy_net, target_net, replay_buffer, optimizer, batch_size, gamma):
+    if len(replay_buffer) < batch_size:
+        return
+    
+    # Получаем мини-батч из памяти опыта
+    states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
+    
+    # Вычисляем текущие Q-значения
+    q_values = policy_net(states).gather(1, actions)
+    
+    # Вычисляем целевые Q-значения
+    with torch.no_grad():
+        next_q_values = target_net(next_states).max(1)[0].unsqueeze(1)
+        target_q_values = rewards + gamma * next_q_values * (~dones)
+    
+    # Вычисляем ошибку потерь
+    loss = F.smooth_l1_loss(q_values, target_q_values)
+    
+    # Обратное распространение ошибки
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+def select_action(state, policy_net, epsilon):
+    if np.random.rand() < epsilon:
+        return env.action_space.sample()  # случайное действие
+    else:
+        with torch.no_grad():
+            q_values = policy_net(torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device))
+            return q_values.argmax().item()  # жадное действие
+
+def train_dqn_agent(env, policy_net, target_net, optimizer, replay_buffer, episodes=10000, batch_size=32, gamma=0.99, epsilon_start=1.0, epsilon_end=0.01, epsilon_decay=10000):
+    epsilon = epsilon_start
+    rewards = []
+    epsilons = []
+    
+    for episode in range(episodes):
+        state = env.reset()[0]
+        state = preprocess_frame(state)
+        frame_stack = deque([state] * 4, maxlen=4)
+        total_reward = 0
+        
+        while True:
+            # Выбор действия
+            action = select_action(stack_frames(frame_stack, state), policy_net, epsilon)
+            
+            # Выполнение действия
+            next_state, reward, done, _, _ = env.step(action)
+            next_state = preprocess_frame(next_state)
+            
+            # Добавление перехода в память опыта
+            replay_buffer.push(stack_frames(frame_stack, state), action, reward, stack_frames(frame_stack, next_state), done)
+            frame_stack.append(next_state)
+            
+            # Обновление награды
+            total_reward += reward
+            
+            # Тренируем модель
+            train_dqn(policy_net, target_net, replay_buffer, optimizer, batch_size, gamma)
+            
+            # Переход к следующему состоянию
+            state = next_state
+            
+            # Если игра завершилась
+            if done:
+                break
+        
+        # Уменьшение epsilon
+        epsilon = max(epsilon_end, epsilon - (epsilon_start - epsilon_end) / epsilon_decay)
+        
+        # Сохраняем данные для графиков
+        rewards.append(total_reward)
+        epsilons.append(epsilon)
+        
+        # Копируем параметры в целевую сеть каждые 1000 эпизодов
+        if episode % 1000 == 0:
+            target_net.load_state_dict(policy_net.state_dict())
+        
+        # Вывод прогресса
+        if episode % 100 == 0:
+            print(f"Episode {episode}/{episodes}, Reward: {total_reward}, Epsilon: {epsilon:.4f}")
+    
+    return rewards, epsilons
+
+import matplotlib.pyplot as plt
+import numpy as np
+epsilons = []  # Инициализация списка для epsilon
+epsilons.append(epsilon)
+
+# Функция для сглаживания данных (например, скользящее среднее)
+def smooth(data, window_size=50):
+    return np.convolve(data, np.ones(window_size)/window_size, mode='valid')
+
+plt.figure(figsize=(14, 6))
+
+# График наград
+plt.subplot(1, 2, 1)
+smoothed_rewards = smooth(rewards)  # Применяем сглаживание
+plt.plot(rewards, alpha=0.3, label="Raw Rewards")  # Исходные данные (полупрозрачные)
+plt.plot(smoothed_rewards, color='red', label="Smoothed Rewards")  # Сглаженные данные
+plt.title("Rewards over Episodes")
+plt.xlabel("Episode")
+plt.ylabel("Reward")
+plt.legend()
+
+# График изменения epsilon
+plt.subplot(1, 2, 2)
+plt.plot(epsilons, color='blue', linestyle='--', label="Epsilon")
+plt.title("Epsilon Decay")
+plt.xlabel("Episode")
+plt.ylabel("Epsilon")
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+import gymnasium as gym
+from collections import deque
+from moviepy.editor import ImageSequenceClip
+import cv2
+
+# Функция предобработки кадра
+def preprocess_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
+    return resized
+
+# Функция выбора действия
+def select_action(state, policy_net, epsilon):
+    if np.random.rand() < epsilon:
+        return env.action_space.sample()  # случайное действие
+    else:
+        with torch.no_grad():
+            q_values = policy_net(torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device))
+            return q_values.argmax().item()  # жадное действие
+
+# Функция записи видео
+def record_video(env, policy_net, video_path="alien_dqn.mp4", max_steps=1000):
+    frames = []
+    state = env.reset()[0]
+    state = preprocess_frame(state)
+    frame_stack = deque([state] * 4, maxlen=4)
+    
+    for _ in range(max_steps):
+        action = select_action(stack_frames(frame_stack, state), policy_net, epsilon=0.01)
+        next_state, _, done, _, _ = env.step(action)
+        next_state = preprocess_frame(next_state)
+        frame_stack.append(next_state)
+        
+        # Получение текущего кадра
+        frame = env.render()  # render_mode='rgb_array' уже установлен при создании среды
+        frames.append(frame)
+        
+        if done:
+            break
+    
+    # Создание видео
+    clip = ImageSequenceClip(frames, fps=30)
+    clip.write_videofile(video_path, codec='libx264')
+    print(f"Video saved to {video_path}")
+
+# Записываем видео
+record_video(env, policy_net)
