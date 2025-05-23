@@ -1,0 +1,232 @@
+!pip install vizdoom opencv-python torch torchvision tqdm
+import vizdoom as vzd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+from collections import deque
+from tqdm import trange
+import cv2
+import matplotlib.pyplot as plt
+import os
+
+cadr = 4
+shape_r = (64, 64)
+memor = 10000
+batch_si = 32
+ler_rate = 1e-4
+Gamma = 0.99
+ep_st = 1.0
+eps_en = 0.1
+eps_de = 100000
+tar_up= 1000
+num_ep = 200
+#создание среды
+def create_env():
+    game = vzd.DoomGame()
+    game.set_doom_scenario_path("defend_the_center.wad")
+    game.set_doom_map("map01")
+    game.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
+    game.set_screen_format(vzd.ScreenFormat.RGB24)
+    game.set_render_hud(False)
+    game.set_render_crosshair(False)
+    game.set_render_weapon(True)
+    game.set_render_decals(False)
+    game.set_render_particles(False)
+
+    game.set_available_buttons([vzd.Button.TURN_LEFT, vzd.Button.TURN_RIGHT, vzd.Button.ATTACK])
+    game.set_episode_timeout(2100)
+    game.set_episode_start_time(10)
+    game.set_window_visible(False)
+    game.set_sound_enabled(False)
+    game.init()
+    return game
+
+
+#Предобработка кадра
+def preprocess(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    resized = cv2.resize(gray, shape_r)
+    return resized / 255.0
+#Q сеть
+class DQN(nn.Module):
+    def __init__(self, n_actions, input_shape=(4, 64, 64)):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+        )
+        conv_out_size = self._get_conv_out(input_shape)
+        self.fc = nn.Sequential(
+            nn.Linear(conv_out_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, n_actions)
+        )
+
+    def _get_conv_out(self, shape):
+        o = self.conv(torch.zeros(1, *shape))
+        return int(np.prod(o.size()))
+
+    def forward(self, x):
+        conv_out = self.conv(x).view(x.size()[0], -1)
+        return self.fc(conv_out)
+class ReplayMemory:
+    def __init__(self, capacity):
+        self.memory = deque(maxlen=capacity)
+
+    def push(self, transition):
+        self.memory.append(transition)
+
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+
+    def __len__(self):
+        return len(self.memory)
+
+# Обучение агента
+def train():
+    game = create_env()
+    n_actions = game.get_available_buttons_size()
+
+    policy_net = DQN(n_actions).cuda()
+    target_net = DQN(n_actions).cuda()
+    target_net.load_state_dict(policy_net.state_dict())
+    target_net.eval()
+
+    optimizer = optim.Adam(policy_net.parameters(), lr=ler_rate)
+    memory = ReplayMemory(memor)
+
+    steps_done = 0
+    epsilon = ep_st
+    episode_rewards = []
+
+    for episode in trange(NUM_EPISODES):
+        game.new_episode()
+        state = preprocess(game.get_state().screen_buffer)
+        state_stack = np.stack([state] * 4, axis=0)
+
+        total_reward = 0
+        while not game.is_episode_finished():
+            steps_done += 1
+            epsilon = max(eps_en, ep_st - steps_done / eps_de)
+
+            if random.random() < epsilon:
+                action_idx = random.randrange(n_actions)
+            else:
+                with torch.no_grad():
+                    state_tensor = torch.tensor([state_stack], dtype=torch.float32).cuda()
+                    q_values = policy_net(state_tensor)
+                    action_idx = q_values.argmax().item()
+
+            action = [0] * n_actions
+            action[action_idx] = 1
+            reward = game.make_action(action, cadr)
+            done = game.is_episode_finished()
+
+            if not done:
+                next_state = preprocess(game.get_state().screen_buffer)
+                next_state_stack = np.roll(state_stack, -1, axis=0)
+                next_state_stack[-1] = next_state
+            else:
+                next_state_stack = np.zeros_like(state_stack)
+
+            memory.push((state_stack, action_idx, reward, next_state_stack, done))
+            state_stack = next_state_stack
+            total_reward += reward
+
+            if len(memory) >= batch_si:
+                transitions = memory.sample(batch_si)
+                states, actions, rewards, next_states, dones = zip(*transitions)
+
+                states = torch.tensor(states, dtype=torch.float32).cuda()
+                actions = torch.tensor(actions, dtype=torch.int64).unsqueeze(1).cuda()
+                rewards = torch.tensor(rewards, dtype=torch.float32).unsqueeze(1).cuda()
+                next_states = torch.tensor(next_states, dtype=torch.float32).cuda()
+                dones = torch.tensor(dones, dtype=torch.bool).unsqueeze(1).cuda()
+
+                q_values = policy_net(states).gather(1, actions)
+                next_q_values = target_net(next_states).max(1)[0].detach().unsqueeze(1)
+                expected_q = rewards + Gamma * next_q_values * (~dones)
+
+                loss = nn.MSELoss()(q_values, expected_q)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            if steps_done % tar_up == 0:
+                target_net.load_state_dict(policy_net.state_dict())
+
+        episode_rewards.append(total_reward)
+        print(f"Episode {episode + 1} | Total reward: {total_reward}")
+
+    torch.save(policy_net.state_dict(), "dqn_defend_model.pth")
+    game.close()
+
+    # График
+    plt.figure(figsize=(10, 5))
+    plt.plot(episode_rewards, label='Total Reward per Episode')
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.title("Training Progress")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+#Демонстрация и Сохранение видео
+
+def test(save_video=True, video_filename="agent_play.avi"):
+    game = create_env()
+    n_actions = game.get_available_buttons_size()
+
+    model = DQN(n_actions).cuda()
+    model.load_state_dict(torch.load("dqn_defend_model.pth"))
+    model.eval()
+
+    game.set_window_visible(True)
+
+    # Видео запись
+    if save_video:
+        fps = 30
+        width, height = 160, 120
+        out = cv2.VideoWriter(video_filename, cv2.VideoWriter_fourcc(*"XVID"), fps, (width, height))
+
+    for _ in range(1):
+        game.new_episode()
+        state = preprocess(game.get_state().screen_buffer)
+        state_stack = np.stack([state] * 4, axis=0)
+
+        while not game.is_episode_finished():
+            state_tensor = torch.tensor([state_stack], dtype=torch.float32).cuda()
+            with torch.no_grad():
+                q_values = model(state_tensor)
+                action_idx = q_values.argmax().item()
+
+            action = [0] * n_actions
+            action[action_idx] = 1
+            game.make_action(action, cadr)
+
+            if not game.is_episode_finished():
+                screen = game.get_state().screen_buffer
+                frame = cv2.cvtColor(screen, cv2.COLOR_RGB2BGR)
+                if save_video:
+                    out.write(frame)
+
+                next_state = preprocess(screen)
+                state_stack = np.roll(state_stack, -1, axis=0)
+                state_stack[-1] = next_state
+
+    game.close()
+    if save_video:
+        out.release()
+        print(f"🎬 Видео сохранено: {video_filename}")
+
+train()  # Обучение и график
+test(save_video=True, video_filename="defend_center_dqn.avi")  # Видео игры
+from IPython.display import Video
+
+Video("vizdoom_agent_video.mp4", embed=True)
